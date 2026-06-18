@@ -96,7 +96,7 @@ int OnInit()
    handleMidEMA  = iMA(_Symbol, InpTimeframe, InpMidEMA, 0, MODE_EMA, PRICE_CLOSE);
    handleSlowEMA = iMA(_Symbol, InpTimeframe, InpSlowEMA, 0, MODE_EMA, PRICE_CLOSE);
    handleRSI     = iRSI(_Symbol, InpTimeframe, 14, PRICE_CLOSE);
-   handleATR     = iATR(_Symbol, InpTimeframe, InpATRPeriod, PRICE_CLOSE);
+   handleATR     = iATR(_Symbol, InpTimeframe, InpATRPeriod);
 
    if(handleFastEMA == INVALID_HANDLE || handleMidEMA == INVALID_HANDLE ||
       handleSlowEMA == INVALID_HANDLE || handleRSI == INVALID_HANDLE ||
@@ -714,9 +714,9 @@ void CheckClosedDeals()
       if(idx >= 0 && entryStates[idx].sessionHour >= 0)
         {
          if(netResult < 0)
-            RecordState(entryStates[idx], false); // LOSS → failed state
+            RecordState(entryStates[idx], false); // LOSS -> failed state
          else if(netResult > 0)
-            RecordState(entryStates[idx], true);  // WIN → success state
+            RecordState(entryStates[idx], true);  // WIN -> success state
         }
 
       // Remove from tracking
