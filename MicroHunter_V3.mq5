@@ -97,36 +97,41 @@ input string InpStateFile        = "MH_V3_states.bin";
 //====================== MARKET STATE STRUCT =======================
 struct MarketState
   {
-   int    trendDir;
-   double rsi;
-   double atrPts;
-   double emaSlope;
-   int    htfDir;
-   int    hour;
+   int    trendDir;    // +1 BUY / -1 SELL
+   double rsi;         // 0-100
+   double atrPts;      // ATR in points
+   double emaSlope;    // (fast-slow)/slow*10000
+   int    htfDir;      // +1/0/-1
+   int    hour;        // server hour
   };
 
 //====================== GLOBALS ==================================
 int g_hFast=INVALID_HANDLE, g_hSlow=INVALID_HANDLE;
 int g_hRSI =INVALID_HANDLE, g_hATR =INVALID_HANDLE, g_hHTF=INVALID_HANDLE;
 
+// Self-learning
 MarketState g_lossStates[], g_winStates[];
 int         g_lossCnt=0,    g_winCnt=0;
 
+// Position tracking per ticket
 ulong       g_tkts[];
 datetime    g_tkEntryTime[];
 double      g_tkSLPts[];
 bool        g_tkPartDone[];
-MarketState g_tkState[];
+MarketState g_tkState[];    // Entry state for learning on close
 
+// Session stats
 int    g_totalTrades=0, g_wins=0, g_losses=0;
 double g_grossProfit=0, g_grossLoss=0;
 
+// Safety
 double   g_dailyBal=0;
 datetime g_dailyDay=0;
 int      g_consecLoss=0;
 double   g_prevATR=0;
 datetime g_lastEntry=0;
 
+// Display
 string   g_lastSignal="INIT", g_lastTrigger="WAIT";
 long     g_tickCount=0;
 datetime g_lastSec=0;
@@ -175,7 +180,10 @@ double NormVol(double v, bool &uf)
   }
 
 double EnforceSL(double pts)
-  { double mn=(double)StopsMin(); return pts<mn?mn:pts; }
+  {
+   double mn=(double)StopsMin();
+   return pts<mn?mn:pts;
+  }
 
 //====================== INDICATORS ===============================
 bool GetInd(double &fast, double &slow, double &rsi, double &atrPts)
@@ -192,12 +200,14 @@ bool GetInd(double &fast, double &slow, double &rsi, double &atrPts)
    return atrPts>0;
   }
 
+// 2-bar confirmed EMA alignment (not single-tick noise)
 int GetEMACross()
   {
    double bF[3],bS[3];
    ArraySetAsSeries(bF,true); ArraySetAsSeries(bS,true);
    if(CopyBuffer(g_hFast,0,0,3,bF)<3) return 0;
    if(CopyBuffer(g_hSlow,0,0,3,bS)<3) return 0;
+   // Both bar[0] AND bar[1] must agree = confirmed trend
    bool upNow=bF[0]>bS[0], upPrev=bF[1]>bS[1];
    bool dnNow=bF[0]<bS[0], dnPrev=bF[1]<bS[1];
    if(upNow && upPrev) return +1;
@@ -219,11 +229,11 @@ double StateDist(const MarketState &a, const MarketState &b)
   {
    if(a.trendDir!=b.trendDir || a.htfDir!=b.htfDir) return 1.0;
    double d=0;
-   double dR=(a.rsi-b.rsi)/100.0; d+=dR*dR;
+   double dR=(a.rsi-b.rsi)/100.0;           d+=dR*dR;
    double av=(a.atrPts+b.atrPts)/2.0;
    double dA=(av>0?(a.atrPts-b.atrPts)/av:0); d+=dA*dA;
    double dE=(a.emaSlope-b.emaSlope)/100.0; d+=dE*dE;
-   double dH=(double)(a.hour-b.hour)/24.0; d+=dH*dH;
+   double dH=(double)(a.hour-b.hour)/24.0;  d+=dH*dH;
    return MathSqrt(d/4.0);
   }
 
@@ -359,8 +369,10 @@ void RemoveTkt(int idx)
       g_tkPartDone[i]=g_tkPartDone[i+1];
       g_tkState[i]=g_tkState[i+1];
      }
-   ArrayResize(g_tkts,n-1); ArrayResize(g_tkEntryTime,n-1);
-   ArrayResize(g_tkSLPts,n-1); ArrayResize(g_tkPartDone,n-1);
+   ArrayResize(g_tkts,n-1);
+   ArrayResize(g_tkEntryTime,n-1);
+   ArrayResize(g_tkSLPts,n-1);
+   ArrayResize(g_tkPartDone,n-1);
    ArrayResize(g_tkState,n-1);
   }
 
@@ -395,7 +407,8 @@ double ComputeLot(double slPts)
    double ts=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
    double p=Pt();
    if(tv<=0||ts<=0||p<=0||slPts<=0) return NormVol(InpFixedLot,uf);
-   double pv=tv*(p/ts); double slMoney=slPts*pv;
+   double pv=tv*(p/ts);
+   double slMoney=slPts*pv;
    if(slMoney<=0) return NormVol(InpFixedLot,uf);
    double out=NormVol(risk/slMoney,uf);
    double margin=0;
@@ -486,7 +499,11 @@ void ManagePositions()
         {
          int elapsed=(int)((TimeCurrent()-g_tkEntryTime[idx])/60);
          if(elapsed>=InpMaxTradeMin)
-           { trade.PositionClose(t); if(InpVerboseLog) Print("TIME EXIT #",t," after ",elapsed,"min"); continue; }
+           {
+            trade.PositionClose(t);
+            if(InpVerboseLog) Print("TIME EXIT #",t," after ",elapsed,"min");
+            continue;
+           }
         }
 
       // Partial close at 1R profit
@@ -497,13 +514,17 @@ void ManagePositions()
          if(closeVol>=mn && (vol-closeVol)>=mn)
            {
             if(trade.PositionClosePartial(t,closeVol))
-              { g_tkPartDone[idx]=true; if(InpVerboseLog) Print("PARTIAL ",DoubleToString(closeVol,2)," of #",t," at 1R"); }
+              {
+               g_tkPartDone[idx]=true;
+               if(InpVerboseLog) Print("PARTIAL ",DoubleToString(closeVol,2)," of #",t," at 1R");
+              }
            }
         }
 
+      // Compute new SL
       double newSL=sl;
 
-      // Breakeven at 1R
+      // Breakeven at 1R (immediately after partial or when 1R reached)
       if(InpUseBreakEven && profPts>=refSL)
         {
          double be=(type==POSITION_TYPE_BUY?open+InpBEOffsetPts*p:open-InpBEOffsetPts*p);
@@ -511,7 +532,7 @@ void ManagePositions()
          if(type==POSITION_TYPE_SELL && (sl==0||be<sl)) newSL=be;
         }
 
-      // Trailing: lock X% of move from open
+      // Trailing: lock InpTrailLockPct% of move from open
       if(InpUseTrailing && profPts>0)
         {
          double lockDist=profPts*(InpTrailLockPct/100.0);
@@ -520,6 +541,7 @@ void ManagePositions()
          if(type==POSITION_TYPE_SELL && (newSL==0||trail<newSL))   newSL=trail;
         }
 
+      // Apply SL improvement
       if(newSL!=sl && newSL!=0)
         {
          double mind=StopsMin()*p;
@@ -532,6 +554,7 @@ void ManagePositions()
 //====================== ENTRY EVALUATION =========================
 void EvaluateEntry()
   {
+   // === SAFETY CIRCUIT BREAKERS ===
    if(DailyLossHit())                               { g_lastTrigger="WAIT(daily_loss)";  return; }
    if(MarginLow())                                  { g_lastTrigger="WAIT(margin)";      return; }
    if(g_consecLoss>=InpMaxConsecLosses)             { g_lastTrigger="WAIT(consec_loss)"; return; }
@@ -540,34 +563,48 @@ void EvaluateEntry()
    if(CountMyPos()>=InpMaxPositions)                { g_lastTrigger="WAIT(max_pos)";     return; }
    if(TimeCurrent()-g_lastEntry<InpCooldownSec)     { g_lastTrigger="WAIT(cooldown)";    return; }
 
+   // === GET INDICATORS ===
    double fast,slow,rsi,atrPts;
    if(!GetInd(fast,slow,rsi,atrPts))                { g_lastTrigger="WAIT(ind_na)";      return; }
 
+   // === ATR FILTERS ===
    if(atrPts<InpMinATRPts)                          { g_lastTrigger="WAIT(atr_low)";     return; }
    if(g_prevATR>0 && atrPts>g_prevATR*InpATRSpikeMult)
      { g_lastTrigger="WAIT(atr_spike)"; g_prevATR=atrPts; return; }
    g_prevATR=atrPts;
 
+   // === SIGNAL: 2-BAR CONFIRMED EMA CROSS ===
    int cross=GetEMACross();
-   if(cross==0) { g_lastSignal="WAIT"; g_lastTrigger="WAIT(no_cross)"; return; }
+   if(cross==0)
+     { g_lastSignal="WAIT"; g_lastTrigger="WAIT(no_cross)"; return; }
 
-   if(cross>0 && rsi>InpRSIBuyMax)  { g_lastSignal="BUY?";  g_lastTrigger="WAIT(rsi_overbought)"; return; }
-   if(cross<0 && rsi<InpRSISellMin) { g_lastSignal="SELL?"; g_lastTrigger="WAIT(rsi_oversold)";   return; }
+   // === RSI SAFE-ZONE FILTER ===
+   if(cross>0 && rsi>InpRSIBuyMax)
+     { g_lastSignal="BUY?"; g_lastTrigger="WAIT(rsi_overbought)"; return; }
+   if(cross<0 && rsi<InpRSISellMin)
+     { g_lastSignal="SELL?"; g_lastTrigger="WAIT(rsi_oversold)"; return; }
 
+   // === HTF TREND GATE ===
    int htf=HTFDir();
-   if(InpUseHTF && cross>0 && htf<0) { g_lastSignal="BUY?";  g_lastTrigger="WAIT(htf_bearish)"; return; }
-   if(InpUseHTF && cross<0 && htf>0) { g_lastSignal="SELL?"; g_lastTrigger="WAIT(htf_bullish)"; return; }
+   if(InpUseHTF && cross>0 && htf<0)
+     { g_lastSignal="BUY?"; g_lastTrigger="WAIT(htf_bearish)"; return; }
+   if(InpUseHTF && cross<0 && htf>0)
+     { g_lastSignal="SELL?"; g_lastTrigger="WAIT(htf_bullish)"; return; }
 
    g_lastSignal=(cross>0?"BUY":"SELL");
 
+   // === SELF-LEARNING: BUILD STATE ===
    MarketState cur;
    cur.trendDir=cross; cur.rsi=rsi; cur.atrPts=atrPts;
    cur.emaSlope=(slow>0?(fast-slow)/slow*10000.0:0);
    cur.htfDir=htf; cur.hour=HourNow();
 
-   if(IsBlockedByLoss(cur))  { g_lastTrigger="WAIT(learn_block)"; return; }
-   if(IsWinConfirmed(cur) && InpVerboseLog) Print("LEARN: high-confidence pattern match!");
+   if(IsBlockedByLoss(cur))
+     { g_lastTrigger="WAIT(learn_block)"; return; }
+   if(IsWinConfirmed(cur) && InpVerboseLog)
+      Print("LEARN: high-confidence pattern match!");
 
+   // === CALC STOPS ===
    double slPts=atrPts*InpSL_ATR_Mult;
    if(slPts<InpMinSLPts) slPts=InpMinSLPts;
    if(slPts>InpMaxSLPts) slPts=InpMaxSLPts;
@@ -577,34 +614,43 @@ void EvaluateEntry()
    double lot=ComputeLot(slPts);
    if(lot<=0) { g_lastTrigger="WAIT(lot_zero)"; return; }
 
+   // === OPEN TRADE ===
    double p=Pt(), price, sl, tp;
    bool ok=false;
    if(cross>0)
-     { price=Ask(); sl=price-slPts*p; tp=price+tpPts*p;
-       ok=trade.Buy(lot,_Symbol,0.0,NormalizeDouble(sl,_Digits),NormalizeDouble(tp,_Digits),"MHV3"); }
+     {
+      price=Ask(); sl=price-slPts*p; tp=price+tpPts*p;
+      ok=trade.Buy(lot,_Symbol,0.0,NormalizeDouble(sl,_Digits),NormalizeDouble(tp,_Digits),"MHV3");
+     }
    else
-     { price=Bid(); sl=price+slPts*p; tp=price-tpPts*p;
-       ok=trade.Sell(lot,_Symbol,0.0,NormalizeDouble(sl,_Digits),NormalizeDouble(tp,_Digits),"MHV3"); }
+     {
+      price=Bid(); sl=price+slPts*p; tp=price-tpPts*p;
+      ok=trade.Sell(lot,_Symbol,0.0,NormalizeDouble(sl,_Digits),NormalizeDouble(tp,_Digits),"MHV3");
+     }
 
    if(ok)
      {
       g_lastEntry=TimeCurrent();
       g_lastTrigger=(cross>0?"OPEN_BUY":"OPEN_SELL");
+
+      // Resolve ticket
       ulong ticket=0;
       ulong deal=trade.ResultDeal();
       if(deal && HistoryDealSelect(deal))
          ticket=(ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID);
       if(!ticket)
          for(int i=PositionsTotal()-1;i>=0;i--)
-           { ulong t=PositionGetTicket(i);
-             if(PositionGetString(POSITION_SYMBOL)==_Symbol && PositionGetInteger(POSITION_MAGIC)==InpMagic)
-               { ticket=t; break; } }
+           {
+            ulong t=PositionGetTicket(i);
+            if(PositionGetString(POSITION_SYMBOL)==_Symbol && PositionGetInteger(POSITION_MAGIC)==InpMagic)
+              { ticket=t; break; }
+           }
       if(ticket) TrackPos(ticket,slPts,cur);
       JournalEntry(cross,lot,trade.ResultPrice(),(int)SpreadPts(),g_lastTrigger,(long)trade.ResultOrder());
       if(InpVerboseLog)
          Print("OPEN ",(cross>0?"BUY":"SELL")," lot=",DoubleToString(lot,2),
                " SL=",DoubleToString(sl,_Digits)," TP=",DoubleToString(tp,_Digits),
-               " ATR=",DoubleToString(atrPts,0)," RSI=",DoubleToString(rsi,1));
+               " ATR=",DoubleToString(atrPts,0)," RSI=",DoubleToString(rsi,1)," SLpts=",DoubleToString(slPts,0));
      }
    else if(InpVerboseLog)
       Print("OPEN FAILED ret=",trade.ResultRetcode()," ",trade.ResultRetcodeDescription());
@@ -626,21 +672,24 @@ int OnInit()
       g_hRSI==INVALID_HANDLE||g_hATR==INVALID_HANDLE||g_hHTF==INVALID_HANDLE)
      { Print("Indicator init failed"); return INIT_FAILED; }
 
-   ArrayResize(g_lossStates,0,InpMaxStates); ArrayResize(g_winStates,0,InpMaxStates);
+   ArrayResize(g_lossStates,0,InpMaxStates);
+   ArrayResize(g_winStates,0,InpMaxStates);
    ArrayResize(g_tkts,0,10); ArrayResize(g_tkEntryTime,0,10);
-   ArrayResize(g_tkSLPts,0,10); ArrayResize(g_tkPartDone,0,10); ArrayResize(g_tkState,0,10);
+   ArrayResize(g_tkSLPts,0,10); ArrayResize(g_tkPartDone,0,10);
+   ArrayResize(g_tkState,0,10);
 
    LoadStates();
    g_dailyBal=AccountInfoDouble(ACCOUNT_BALANCE);
    EventSetTimer(InpTimerSec);
-   Print("MicroHunter V3 init | ",_Symbol," | Timer=",InpTimerSec,"s | Bal=$",
-         DoubleToString(g_dailyBal,2)," | Loss=",g_lossCnt," Win=",g_winCnt);
+   Print("MicroHunter V3 init | ",_Symbol," | Timer=",InpTimerSec,
+         "s | Bal=$",DoubleToString(g_dailyBal,2)," | LossStates=",g_lossCnt," WinStates=",g_winCnt);
    return INIT_SUCCEEDED;
   }
 
 void OnDeinit(const int reason)
   {
-   EventKillTimer(); SaveStates();
+   EventKillTimer();
+   SaveStates();
    if(g_hFast!=INVALID_HANDLE) IndicatorRelease(g_hFast);
    if(g_hSlow!=INVALID_HANDLE) IndicatorRelease(g_hSlow);
    if(g_hRSI !=INVALID_HANDLE) IndicatorRelease(g_hRSI);
@@ -648,10 +697,15 @@ void OnDeinit(const int reason)
    if(g_hHTF !=INVALID_HANDLE) IndicatorRelease(g_hHTF);
    Comment("");
    Print("MicroHunter V3 deinit | Trades=",g_totalTrades," W=",g_wins," L=",g_losses,
-         " PF=",(g_grossLoss>0?DoubleToString(g_grossProfit/g_grossLoss,2):"n/a"));
+         " PF=",(g_grossLoss>0?DoubleToString(g_grossProfit/g_grossLoss,2):"n/a"),
+         " LossStates=",g_lossCnt," WinStates=",g_winCnt);
   }
 
-void OnTimer()   { EvaluateEntry(); UpdateDisplay(); }
+void OnTimer()
+  {
+   EvaluateEntry();
+   UpdateDisplay();
+  }
 
 void OnTick()
   {
@@ -659,7 +713,7 @@ void OnTick()
    datetime now=TimeCurrent();
    if(now!=g_lastSec){g_ticksPerSec=g_ticksThisSec;g_ticksThisSec=0;g_lastSec=now;}
    g_ticksThisSec++;
-   ManagePositions();
+   ManagePositions(); // Position mgmt stays on every tick for responsiveness
   }
 
 void OnTradeTransaction(const MqlTradeTransaction &trans,
@@ -679,24 +733,28 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
              +HistoryDealGetDouble(deal,DEAL_SWAP)
              +HistoryDealGetDouble(deal,DEAL_COMMISSION);
    double price=HistoryDealGetDouble(deal,DEAL_PRICE);
-   double lot  =HistoryDealGetDouble(deal,DEAL_VOLUME);
-   long   dtype=HistoryDealGetInteger(deal,DEAL_TYPE);
+   double lot=HistoryDealGetDouble(deal,DEAL_VOLUME);
+   long dtype=HistoryDealGetInteger(deal,DEAL_TYPE);
    string closed=(dtype==DEAL_TYPE_SELL?"BUY":"SELL");
 
    ulong pid=(ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID);
-   int   idx=FindTkt(pid);
+   int idx=FindTkt(pid);
 
-   // Only count as final close when position is gone
+   // Only count as final close if position no longer open
    bool stillOpen=PositionSelectByTicket(pid);
    if(!stillOpen)
      {
       g_totalTrades++;
       if(net>=0)
-        { g_wins++; g_grossProfit+=net; g_consecLoss=0;
-          if(idx>=0) StoreState(g_tkState[idx],true); }
+        {
+         g_wins++; g_grossProfit+=net; g_consecLoss=0;
+         if(idx>=0) StoreState(g_tkState[idx],true);   // Learn from win
+        }
       else
-        { g_losses++; g_grossLoss+=(-net); g_consecLoss++;
-          if(idx>=0) StoreState(g_tkState[idx],false); }
+        {
+         g_losses++; g_grossLoss+=(-net); g_consecLoss++;
+         if(idx>=0) StoreState(g_tkState[idx],false);  // Learn from loss
+        }
       if(idx>=0) RemoveTkt(idx);
       JournalExit(deal,closed,lot,price,net);
       if(InpVerboseLog) Print("EXIT ",closed," net=",DoubleToString(net,2)," consec=",g_consecLoss);
