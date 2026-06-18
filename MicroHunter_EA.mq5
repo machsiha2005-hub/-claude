@@ -79,9 +79,10 @@ int               successCount = 0;
 
 double            peakProfit[];      // track peak profit per position ticket
 ulong             trackedTickets[];  // position tickets being tracked
+MarketState       entryStates[];     // entry-time MarketState snapshot per tracked position
 
 datetime          lastTradeTime = 0;
-int               totalTradesSession = 0;
+ulong             lastProcessedDeal = 0; // dedupe guard for CheckClosedDeals
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                             |
@@ -113,6 +114,7 @@ int OnInit()
    ArrayResize(SuccessStates, 0, InpMaxStates);
    ArrayResize(peakProfit, 0, 10);
    ArrayResize(trackedTickets, 0, 10);
+   ArrayResize(entryStates, 0, 10);
 
    LoadStatesFromFile();
 
@@ -160,6 +162,7 @@ void OnTimer()
 //+------------------------------------------------------------------+
 void OnTick()
   {
+   symInfo.Refresh();
    ManageOpenPositions();
   }
 
@@ -282,10 +285,11 @@ bool IsFailedStateMatch(const MarketState &current)
 
    for(int i = 0; i < failedCount; i++)
      {
-      if(StateSimilarity(current, FailedStates[i]) >= InpMatchThreshold)
+      double sim = StateSimilarity(current, FailedStates[i]);
+      if(sim >= InpMatchThreshold)
         {
          Print("BLOCKED: Current state matches Failed State #", i,
-               " (similarity: ", DoubleToString(StateSimilarity(current, FailedStates[i]) * 100, 1), "%)");
+               " (similarity: ", DoubleToString(sim * 100, 1), "%)");
          return true;
         }
      }
@@ -459,6 +463,11 @@ void EvaluateEntry()
    if(IsFailedStateMatch(currentState))
       return;
 
+   // High-confidence boost: log when state matches a known winner
+   bool highConfidence = IsSuccessStateMatch(currentState);
+   if(highConfidence)
+      Print("HIGH-CONFIDENCE: Current state matches a known successful pattern");
+
    // Calculate SL and TP
    double slPoints = CalculateSLPoints(atr);
    double tpPoints = slPoints * InpRRRatio;
@@ -477,8 +486,7 @@ void EvaluateEntry()
       if(trade.Buy(lotSize, _Symbol, symInfo.Ask(), sl, tp, "MicroHunter BUY"))
         {
          lastTradeTime = TimeCurrent();
-         totalTradesSession++;
-         TrackPosition(trade.ResultOrder());
+         TrackNewPosition(currentState);
          Print("BUY opened | Lot=", lotSize, " SL=", sl, " TP=", tp,
                " RSI=", DoubleToString(rsi, 1), " ATR=", DoubleToString(atr, 6));
         }
@@ -496,8 +504,7 @@ void EvaluateEntry()
       if(trade.Sell(lotSize, _Symbol, symInfo.Bid(), sl, tp, "MicroHunter SELL"))
         {
          lastTradeTime = TimeCurrent();
-         totalTradesSession++;
-         TrackPosition(trade.ResultOrder());
+         TrackNewPosition(currentState);
          Print("SELL opened | Lot=", lotSize, " SL=", sl, " TP=", tp,
                " RSI=", DoubleToString(rsi, 1), " ATR=", DoubleToString(atr, 6));
         }
@@ -507,15 +514,60 @@ void EvaluateEntry()
   }
 
 //+------------------------------------------------------------------+
-//| TRACK POSITION FOR TRAILING                                       |
+//| TRACK POSITION FOR TRAILING + STORE ENTRY STATE                   |
 //+------------------------------------------------------------------+
-void TrackPosition(ulong ticket)
+void TrackPosition(ulong ticket, const MarketState &entryState)
   {
    int size = ArraySize(trackedTickets);
    ArrayResize(trackedTickets, size + 1);
    ArrayResize(peakProfit, size + 1);
+   ArrayResize(entryStates, size + 1);
    trackedTickets[size] = ticket;
    peakProfit[size]     = 0;
+   entryStates[size]    = entryState;
+  }
+
+//+------------------------------------------------------------------+
+//| TRACK NEW POSITION — resolve the position ticket from result      |
+//+------------------------------------------------------------------+
+void TrackNewPosition(const MarketState &entryState)
+  {
+   // Resolve position ticket from the deal that opened it
+   ulong dealTicket = trade.ResultDeal();
+   ulong positionId = 0;
+
+   if(dealTicket != 0 && HistoryDealSelect(dealTicket))
+      positionId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+
+   if(positionId == 0)
+     {
+      // Fallback: latest position on this symbol with our magic
+      for(int i = PositionsTotal() - 1; i >= 0; i--)
+        {
+         if(posInfo.SelectByIndex(i) &&
+            posInfo.Symbol() == _Symbol &&
+            posInfo.Magic() == 777555)
+           {
+            positionId = posInfo.Ticket();
+            break;
+           }
+        }
+     }
+
+   if(positionId != 0)
+      TrackPosition(positionId, entryState);
+  }
+
+//+------------------------------------------------------------------+
+//| TRACK POSITION WITHOUT ENTRY STATE (recovery / orphan)            |
+//+------------------------------------------------------------------+
+void TrackPositionOrphan(ulong ticket)
+  {
+   MarketState empty;
+   empty.trendDirection = 0;
+   empty.rsi = 0; empty.atr = 0; empty.emaDist = 0;
+   empty.sessionHour = -1; empty.spread = 0;
+   TrackPosition(ticket, empty);
   }
 
 //+------------------------------------------------------------------+
@@ -544,7 +596,7 @@ void ManageOpenPositions()
 
       if(idx < 0)
         {
-         TrackPosition(ticket);
+         TrackPositionOrphan(ticket);
          idx = ArraySize(trackedTickets) - 1;
         }
 
@@ -625,11 +677,17 @@ void CheckClosedDeals()
    if(!HistorySelect(from, to)) return;
 
    int totalDeals = HistoryDealsTotal();
+   ulong maxDealSeen = lastProcessedDeal;
 
-   for(int i = totalDeals - 1; i >= 0; i--)
+   for(int i = 0; i < totalDeals; i++) // oldest -> newest
      {
       ulong dealTicket = HistoryDealGetTicket(i);
       if(dealTicket == 0) continue;
+
+      // DEDUPE: skip deals already processed
+      if(dealTicket <= lastProcessedDeal) continue;
+
+      if(dealTicket > maxDealSeen) maxDealSeen = dealTicket;
 
       // Only our EA's deals
       if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) != 777555) continue;
@@ -643,39 +701,41 @@ void CheckClosedDeals()
       double dealSwap   = HistoryDealGetDouble(dealTicket, DEAL_SWAP);
       double netResult  = dealProfit + dealComm + dealSwap;
 
-      // Get conditions at time of entry (approximate from current state)
-      double fastEMA, midEMA, slowEMA, rsi, atr;
-      if(!GetIndicators(fastEMA, midEMA, slowEMA, rsi, atr)) continue;
+      ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
 
-      int dealType = (int)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
-      int direction = (dealType == DEAL_TYPE_SELL) ? +1 : -1; // closing sell = was buy
-
-      double entryPrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
-      MarketState state = CaptureState(direction, rsi, atr, entryPrice, midEMA);
-
-      if(netResult < 0)
-         RecordState(state, false); // LOSS → failed state
-      else if(netResult > 0)
-         RecordState(state, true);  // WIN → success state
-
-      // Remove from tracking
+      // Find the stored ENTRY-TIME state for this position
+      int idx = -1;
       for(int j = 0; j < ArraySize(trackedTickets); j++)
         {
-         ulong posId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-         if(trackedTickets[j] == posId)
+         if(trackedTickets[j] == posId) { idx = j; break; }
+        }
+
+      // Only record if we have the actual entry state (not an orphan with sessionHour=-1)
+      if(idx >= 0 && entryStates[idx].sessionHour >= 0)
+        {
+         if(netResult < 0)
+            RecordState(entryStates[idx], false); // LOSS → failed state
+         else if(netResult > 0)
+            RecordState(entryStates[idx], true);  // WIN → success state
+        }
+
+      // Remove from tracking
+      if(idx >= 0)
+        {
+         int n = ArraySize(trackedTickets);
+         for(int k = idx; k < n - 1; k++)
            {
-            // Shift arrays
-            for(int k = j; k < ArraySize(trackedTickets) - 1; k++)
-              {
-               trackedTickets[k] = trackedTickets[k + 1];
-               peakProfit[k]     = peakProfit[k + 1];
-              }
-            ArrayResize(trackedTickets, ArraySize(trackedTickets) - 1);
-            ArrayResize(peakProfit, ArraySize(peakProfit) - 1);
-            break;
+            trackedTickets[k] = trackedTickets[k + 1];
+            peakProfit[k]     = peakProfit[k + 1];
+            entryStates[k]    = entryStates[k + 1];
            }
+         ArrayResize(trackedTickets, n - 1);
+         ArrayResize(peakProfit, n - 1);
+         ArrayResize(entryStates, n - 1);
         }
      }
+
+   lastProcessedDeal = maxDealSeen;
   }
 
 //+------------------------------------------------------------------+
@@ -732,13 +792,21 @@ void LoadStatesFromFile()
    int fileHandle = FileOpen("MicroHunter_States.bin", FILE_READ | FILE_BIN);
    if(fileHandle == INVALID_HANDLE) return;
 
-   // Read failed states
+   bool corrupted = false;
+
+   // Read failed states header
+   if(FileIsEnding(fileHandle)) { FileClose(fileHandle); return; }
    failedCount = FileReadInteger(fileHandle);
-   if(failedCount > InpMaxStates) failedCount = InpMaxStates;
+   if(failedCount < 0 || failedCount > InpMaxStates)
+     {
+      Print("WARNING: failedCount out of range (", failedCount, ") — resetting");
+      failedCount = 0; corrupted = true;
+     }
    ArrayResize(FailedStates, failedCount);
 
-   for(int i = 0; i < failedCount; i++)
+   for(int i = 0; i < failedCount && !corrupted; i++)
      {
+      if(FileIsEnding(fileHandle)) { failedCount = i; corrupted = true; break; }
       FailedStates[i].trendDirection = FileReadInteger(fileHandle);
       FailedStates[i].rsi            = FileReadDouble(fileHandle);
       FailedStates[i].atr            = FileReadDouble(fileHandle);
@@ -747,13 +815,27 @@ void LoadStatesFromFile()
       FailedStates[i].spread         = FileReadDouble(fileHandle);
      }
 
-   // Read success states
+   // Read success states header
+   if(corrupted || FileIsEnding(fileHandle))
+     {
+      successCount = 0;
+      ArrayResize(SuccessStates, 0);
+      FileClose(fileHandle);
+      Print("States loaded (truncated): Failed=", failedCount, " Success=0");
+      return;
+     }
+
    successCount = FileReadInteger(fileHandle);
-   if(successCount > InpMaxStates) successCount = InpMaxStates;
+   if(successCount < 0 || successCount > InpMaxStates)
+     {
+      Print("WARNING: successCount out of range (", successCount, ") — resetting");
+      successCount = 0;
+     }
    ArrayResize(SuccessStates, successCount);
 
    for(int i = 0; i < successCount; i++)
      {
+      if(FileIsEnding(fileHandle)) { successCount = i; ArrayResize(SuccessStates, i); break; }
       SuccessStates[i].trendDirection = FileReadInteger(fileHandle);
       SuccessStates[i].rsi            = FileReadDouble(fileHandle);
       SuccessStates[i].atr            = FileReadDouble(fileHandle);
